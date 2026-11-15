@@ -1,0 +1,7 @@
+# Entorno virtual del proyecto; no instalar paquetes del sistema.
+-r api/requirements.txt
+pytest==9.0.1
+iniconfig==2.3.0
+packaging==25.0
+pluggy==1.6.0
+pygments==2.19.2

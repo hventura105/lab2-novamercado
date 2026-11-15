@@ -1,0 +1,222 @@
+name: lab2-novamercado
+
+x-airflow: &airflow
+  image: apache/airflow:3.1.7-python3.12
+  user: "50000:0"
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/config/passwords.json
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:?Generar .env con scripts/infra.py init-env}@airflow-db:5432/${AIRFLOW_DB_NAME:-airflow_metadata}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Falta AIRFLOW_FERNET_KEY}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?Falta AIRFLOW_JWT_SECRET}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?Falta AIRFLOW_API_SECRET_KEY}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__CORE__PARALLELISM: "4"
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    NOVAMERCADO_API_URL: http://api:8000
+    INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Ejecutar scripts/infra.py init-env para agregar el token interno}
+    PYTHONDONTWRITEBYTECODE: "1"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./airflow/plugins:/opt/airflow/plugins:ro
+    - ./airflow/scripts:/opt/airflow/scripts:ro
+    - ./checks:/opt/checks:ro
+    - airflow-logs:/opt/airflow/logs
+    - airflow-config:/opt/airflow/config
+  networks: [internal]
+  restart: unless-stopped
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
+
+services:
+  product-db:
+    image: postgres:16.11-bookworm
+    environment:
+      POSTGRES_DB: ${PRODUCT_DB_NAME:-novamercado}
+      POSTGRES_USER: ${PRODUCT_DB_USER:-novamercado}
+      POSTGRES_PASSWORD: ${PRODUCT_DB_PASSWORD:?Falta PRODUCT_DB_PASSWORD}
+    volumes:
+      - product-db-data:/var/lib/postgresql/data
+    networks: [internal]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  airflow-db:
+    image: postgres:16.11-bookworm
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow_metadata}
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?Falta AIRFLOW_DB_PASSWORD}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    networks: [internal]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    image: lab2-novamercado-mlflow:3.10.1
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --workers=1
+      - --backend-store-uri=sqlite:////mlflow/mlflow.db
+      - --serve-artifacts
+      - --artifacts-destination=/mlflow/artifacts
+      - --allowed-hosts=mlflow:5000,localhost:*,127.0.0.1:*
+    ports:
+      - target: 5000
+        published: "${MLFLOW_HOST_PORT:-5000}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - mlflow-data:/mlflow
+    networks: [internal, publicacion]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5)"]
+      interval: 10s
+      timeout: 8s
+      retries: 18
+      start_period: 30s
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: lab2-novamercado-api:1.0.0
+    environment:
+      PRODUCT_DB_HOST: product-db
+      PRODUCT_DB_PORT: "5432"
+      PRODUCT_DB_NAME: ${PRODUCT_DB_NAME:-novamercado}
+      PRODUCT_DB_USER: ${PRODUCT_DB_USER:-novamercado}
+      PRODUCT_DB_PASSWORD: ${PRODUCT_DB_PASSWORD:?Falta PRODUCT_DB_PASSWORD}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      AIRFLOW_HEALTH_URL: http://airflow-api-server:8080/api/v2/monitor/health
+      AIRFLOW_URL: http://airflow-api-server:8080
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Falta AIRFLOW_ADMIN_PASSWORD}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Ejecutar scripts/infra.py init-env}
+      DATA_DIRECTORY: /data/entrada
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - target: 8000
+        published: "${API_HOST_PORT:-8000}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - ./data/entrada:/data/entrada:ro
+    networks: [internal, publicacion]
+    restart: unless-stopped
+    depends_on:
+      product-db:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=10)"]
+      interval: 15s
+      timeout: 12s
+      retries: 12
+      start_period: 20s
+
+  airflow-init:
+    <<: *airflow
+    user: "0:0"
+    entrypoint: [/usr/bin/dumb-init, --, /bin/bash]
+    command:
+      - -ec
+      - |
+        chown -R 50000:0 /opt/airflow/logs /opt/airflow/config
+        exec /entrypoint python /opt/airflow/scripts/init_airflow.py
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Falta AIRFLOW_ADMIN_PASSWORD}
+    restart: "no"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+
+  airflow-api-server:
+    <<: *airflow
+    command: api-server
+    ports:
+      - target: 8080
+        published: "${AIRFLOW_HOST_PORT:-8080}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    networks: [internal, publicacion]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v2/monitor/health', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 18
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8974/health', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 30s
+
+  airflow-dag-processor:
+    <<: *airflow
+    command: dag-processor
+    healthcheck:
+      test: [CMD-SHELL, 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 20s
+      timeout: 15s
+      retries: 12
+      start_period: 30s
+
+  airflow-triggerer:
+    <<: *airflow
+    command: triggerer
+    healthcheck:
+      test: [CMD-SHELL, 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 20s
+      timeout: 15s
+      retries: 12
+      start_period: 30s
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  publicacion:
+    driver: bridge
+    internal: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: nat
+
+volumes:
+  product-db-data:
+  airflow-db-data:
+  mlflow-data:
+  airflow-logs:
+  airflow-config:

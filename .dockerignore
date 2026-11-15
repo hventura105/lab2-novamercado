@@ -1,0 +1,12 @@
+.env
+.env.*
+.git
+.aws
+.agents
+.codex
+.venv
+**/__pycache__
+data
+evidence
+ml
+docs
